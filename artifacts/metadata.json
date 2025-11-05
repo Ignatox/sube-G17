@@ -1,0 +1,27 @@
+{
+  "model_name": "Linear Regression",
+  "date_col": "fecha",
+  "target_col": "cantidad",
+  "requires_history": false,
+  "dropped_cols": [
+    "fecha",
+    "provincia",
+    "nombre_feriado",
+    "tipo_transporte",
+    "tipo_feriado",
+    "linea",
+    "empresa"
+  ],
+  "winsorize_cols": [
+    "t_med",
+    "precip",
+    "tmax",
+    "tmin"
+  ],
+  "sklearn_version": "1.7.2",
+  "metrics": {
+    "valid_rmse": 18319.700950637405,
+    "valid_r2": 0.07059719342659021,
+    "training_time_seconds": 0.501936674118042
+  }
+}
