@@ -4,6 +4,9 @@ import numpy as np
 import joblib
 import altair as alt
 from datetime import datetime
+import json
+import requests
+from datetime import date as date_cls
 
 from sklearn.base import BaseEstimator, TransformerMixin
 
@@ -129,6 +132,61 @@ class Winsorizer(BaseEstimator, TransformerMixin):
                     self.upper_bounds[col],
                 )
         return X_transformed
+
+
+class LagFeatureCreator(BaseEstimator, TransformerMixin):
+    """
+    Crea features de lag para series temporales agrupadas.
+    Replica la implementación utilizada en el notebook IGNA_Entrega3.
+    """
+
+    def __init__(
+        self,
+        target_col: str = "cantidad",
+        date_col: str = "fecha",
+        group_cols=None,
+        lags=None,
+        rolling_windows=None,
+    ):
+        self.target_col = target_col
+        self.date_col = date_col
+        self.group_cols = group_cols or ["linea", "municipio"]
+        self.lags = lags or [28]
+        self.rolling_windows = rolling_windows or [7, 28]
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+
+        # Asegurar tipo datetime y ordenar
+        if self.date_col in X.columns and not pd.api.types.is_datetime64_any_dtype(X[self.date_col]):
+            X[self.date_col] = pd.to_datetime(X[self.date_col], errors="coerce")
+
+        if self.date_col in X.columns:
+            X = X.sort_values(self.date_col).reset_index(drop=True)
+
+        def add_lags(g: pd.DataFrame):
+            g = g.sort_values(self.date_col)
+
+            # Crear lags de la columna objetivo si existe
+            if self.target_col in g.columns:
+                for lag in self.lags:
+                    g[f"lag_{lag}"] = g[self.target_col].shift(lag)
+
+                # Indicadores de lag faltante
+                for lag in self.lags:
+                    g[f"has_lag_{lag}"] = g[f"lag_{lag}"].isnull().astype(int)
+
+            return g
+
+        if set(self.group_cols).issubset(set(X.columns)):
+            X = X.groupby(self.group_cols, group_keys=False).apply(add_lags)
+        else:
+            X = add_lags(X)
+
+        return X
 
 
 class HistoricalProfileEncoder(BaseEstimator, TransformerMixin):
@@ -374,6 +432,128 @@ def load_full_data(path: str = REFERENCE_CSV):
         return pd.DataFrame()
 
 
+@st.cache_data(show_spinner=False)
+def get_line_options(df: pd.DataFrame):
+    if df.empty:
+        return []
+    return sorted(df['linea'].dropna().astype(str).unique().tolist())
+
+
+@st.cache_data(show_spinner=False)
+def get_municipios_for_line(df: pd.DataFrame, linea: str):
+    if df.empty:
+        return []
+    sub = df[df['linea'].astype(str) == str(linea)]
+    return sorted(sub['municipio'].dropna().astype(str).unique().tolist())
+
+
+@st.cache_data(show_spinner=False)
+def get_default_empresa_for_line_muni(df: pd.DataFrame, linea: str, municipio: str) -> str:
+    if df.empty:
+        return ""
+    sub = df[(df['linea'].astype(str) == str(linea)) & (df['municipio'].astype(str) == str(municipio))]
+    if sub.empty:
+        return ""
+    return sub['empresa'].astype(str).mode().iloc[0]
+
+
+@st.cache_data(show_spinner=False)
+def get_default_provincia_for_line_muni(df: pd.DataFrame, linea: str, municipio: str) -> str:
+    if df.empty:
+        return ""
+    sub = df[(df['linea'].astype(str) == str(linea)) & (df['municipio'].astype(str) == str(municipio))]
+    if sub.empty:
+        return ""
+    return sub['provincia'].astype(str).mode().iloc[0]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_municipio_centroid(municipio: str, provincia: str | None = None):
+    """Obtiene lat/lon del municipio desde georef. Fallback: centroide de provincia."""
+    base = "https://apis.datos.gob.ar/georef/api/municipios"
+    params = {"aplanar": "true", "max": 10, "nombre": municipio}
+    if provincia:
+        params["provincia"] = provincia
+    try:
+        r = requests.get(base, params=params, timeout=20)
+        r.raise_for_status()
+        js = r.json()
+        munis = js.get("municipios", [])
+        if munis:
+            m = munis[0]
+            lat = pd.to_numeric(m.get("centroide_lat"), errors="coerce")
+            lon = pd.to_numeric(m.get("centroide_lon"), errors="coerce")
+            if pd.notna(lat) and pd.notna(lon) and lat != 0 and lon != 0:
+                return float(lat), float(lon)
+    except Exception:
+        pass
+
+    # Fallback: centroide de provincia
+    if not provincia:
+        return None, None
+    try:
+        r = requests.get(
+            "https://apis.datos.gob.ar/georef/api/provincias",
+            params={"aplanar": "true", "nombre": provincia, "max": 1},
+            timeout=20,
+        )
+        r.raise_for_status()
+        js = r.json()
+        provs = js.get("provincias", [])
+        if provs:
+            p = provs[0]
+            lat = pd.to_numeric(p.get("centroide_lat"), errors="coerce")
+            lon = pd.to_numeric(p.get("centroide_lon"), errors="coerce")
+            if pd.notna(lat) and pd.notna(lon):
+                return float(lat), float(lon)
+    except Exception:
+        pass
+    return None, None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_daily_weather(lat: float, lon: float, fecha: pd.Timestamp):
+    """Obtiene clima diario (tmax, tmin, precip, viento) para una fecha concreta.
+    Usa archive para fechas pasadas, forecast para futuras.
+    """
+    if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))):
+        return None
+    day = fecha.strftime("%Y-%m-%d")
+    tz = "America/Argentina/Buenos_Aires"
+    today = pd.Timestamp.today().normalize()
+    if fecha <= today:
+        url = "https://archive-api.open-meteo.com/v1/archive"
+    else:
+        url = "https://api.open-meteo.com/v1/forecast"
+    try:
+        r = requests.get(
+            url,
+            params={
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "start_date": day,
+                "end_date": day,
+                "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max",
+                "timezone": tz,
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        js = r.json()
+        daily = js.get("daily", {})
+        if daily and daily.get("time"):
+            idx = 0
+            return {
+                "tmax": daily.get("temperature_2m_max", [None])[idx],
+                "tmin": daily.get("temperature_2m_min", [None])[idx],
+                "precip": daily.get("precipitation_sum", [None])[idx],
+                "viento": daily.get("windspeed_10m_max", [None])[idx],
+            }
+    except Exception:
+        return None
+    return None
+
+
 def create_temporal_distribution_chart(df):
     """Gráfico 1: Distribución temporal de pasajeros por mes"""
     if df.empty:
@@ -563,9 +743,12 @@ def build_input_dataframe(form_data):
     record["tmin"] = form_data["tmin"]
     record["precip"] = form_data["precip"]
     record["viento"] = form_data["viento"]
-    
+
     # Campo de feriado (solo is_feriado se usa, los otros se eliminan en el pipeline)
     record["is_feriado"] = int(form_data["is_feriado"])
+
+    # Columna objetivo vacía (necesaria para generar lags en el pipeline de FE)
+    record["cantidad"] = np.nan
     
     # Estos campos se eliminan en el preprocesador pero los incluimos para compatibilidad
     record["tipo_transporte"] = ""
@@ -606,6 +789,14 @@ tab1, tab2 = st.tabs(["📊 Exploración de Datos", "🔮 Predicción"])
 fe_pipeline, preprocessor, model = load_artifacts()
 reference = load_reference_data()
 df_full = load_full_data()
+
+# Intentar cargar metadata del modelo para mostrar nombre/modelo
+try:
+    with open("artifacts/metadata.json", "r") as f:
+        _meta = json.load(f)
+    MODEL_NAME = _meta.get("model_name", "Modelo entrenado")
+except Exception:
+    MODEL_NAME = "Modelo entrenado"
 
 if any(obj is None for obj in (fe_pipeline, preprocessor, model)):
     st.error("⚠️ No se pudieron cargar los artefactos del modelo. Verificá que los archivos estén en la carpeta 'artifacts/'.")
@@ -701,95 +892,163 @@ with tab2:
     """)
     
     st.subheader("📋 Ingresá los datos")
-    st.caption("Completá los campos con la información de la fecha a predecir.")
+    st.caption("Elegí la fecha y la línea. La app predecirá para todos los municipios de esa línea.")
 
-    empresa_opts = select_options.get("empresa") or [""]
-    linea_opts = select_options.get("linea") or [""]
-    municipio_opts = select_options.get("municipio") or [""]
+    line_opts = get_line_options(df_full)
 
+    total_placeholder = None
     with st.form("prediction_form"):
-        col_left, col_right = st.columns(2)
+        col_left, col_right = st.columns([3, 1])
 
         with col_left:
-            st.markdown("### 📍 Información del servicio")
-            fecha = st.date_input("Fecha", value=pd.Timestamp("2023-01-01").date())
-            empresa = st.selectbox("Empresa", options=empresa_opts, index=0)
-            linea = st.selectbox("Línea", options=linea_opts, index=0)
-            municipio = st.selectbox("Municipio", options=municipio_opts, index=0)
+            st.markdown("### 📍 Selección")
+            # Fechas con validación contra último dato del CSV (+16 días)
+            last_date = pd.to_datetime(df_full['fecha'].max()) if not df_full.empty else pd.Timestamp.today()
+            max_allowed = (last_date + pd.Timedelta(days=16)).date()
+            default_start = min((last_date + pd.Timedelta(days=1)).date(), max_allowed) if not df_full.empty else pd.Timestamp.today().date()
+            fecha_desde = st.date_input("Fecha desde", value=default_start, max_value=max_allowed)
+            fecha_hasta = st.date_input(
+                "Predecir hasta",
+                value=default_start,
+                min_value=fecha_desde,
+                max_value=max_allowed,
+            )
+            linea = st.selectbox("Línea", options=line_opts, index=0)
 
         with col_right:
-            st.markdown("### 🌤 Condiciones del día")
-            is_feriado = st.selectbox(
-                "¿Es feriado?", 
-                options=[0, 1], 
-                format_func=lambda x: "Sí" if x == 1 else "No", 
-                index=0
-            )
-            tmax = st.number_input("Temperatura máxima (°C)", value=25.0, step=0.5)
-            tmin = st.number_input("Temperatura mínima (°C)", value=18.0, step=0.5)
-            precip = st.number_input("Precipitación (mm)", value=0.0, step=0.1, min_value=0.0)
-            viento = st.number_input("Viento (km/h)", value=10.0, step=0.5, min_value=0.0)
+            st.markdown("### 🔢 Predicción total")
+            total_placeholder = st.empty()
+            total_placeholder.info("La suma total del rango aparecerá aquí luego de predecir.")
 
         submitted = st.form_submit_button("🔮 Predecir", use_container_width=True)
 
     if submitted:
-        form_values = {
-            "fecha": fecha,
-            "empresa": empresa,
-            "linea": linea,
-            "municipio": municipio,
-            "is_feriado": is_feriado,
-            "tmax": tmax,
-            "tmin": tmin,
-            "precip": precip,
-            "viento": viento,
-        }
+        # Validación de fechas
+        last_date = pd.to_datetime(df_full['fecha'].max()) if not df_full.empty else pd.Timestamp.today()
+        max_limit = last_date + pd.Timedelta(days=16)
+        fecha_desde_ts = pd.Timestamp(fecha_desde)
+        fecha_hasta_ts = pd.Timestamp(fecha_hasta)
 
-        input_df = build_input_dataframe(form_values)
+        if fecha_desde_ts > fecha_hasta_ts:
+            st.error("La fecha 'desde' no puede ser mayor a 'hasta'.")
+            st.stop()
+
+        if fecha_hasta_ts > max_limit:
+            st.error(
+                f"La fecha seleccionada debe ser como máximo 16 días posterior al último dato del CSV ({last_date.date()}). "
+                f"Máximo permitido: {max_limit.date()}"
+            )
+            st.stop()
+
+        # Municipios para la línea seleccionada
+        municipios = get_municipios_for_line(df_full, linea)
+        if not municipios:
+            st.warning("No se encontraron municipios para la línea seleccionada en el CSV.")
+            st.stop()
+
+        # Precalcular info por municipio
+        muni_info = []
+        for muni in municipios:
+            prov = get_default_provincia_for_line_muni(df_full, linea, muni)
+            emp = get_default_empresa_for_line_muni(df_full, linea, muni)
+            lat, lon = fetch_municipio_centroid(muni, prov)
+            muni_info.append({
+                "municipio": muni,
+                "provincia": prov or "",
+                "empresa": emp,
+                "lat": lat,
+                "lon": lon,
+            })
+
+        # Construir registros para cada fecha del rango
+        records = []
+        for single_date in pd.date_range(fecha_desde_ts, fecha_hasta_ts, freq="D"):
+            for info in muni_info:
+                lat = info["lat"]
+                lon = info["lon"]
+                weather = fetch_daily_weather(lat, lon, single_date) if (lat is not None and lon is not None) else None
+
+                if weather is None:
+                    tmax = tmin = precip = viento = np.nan
+                else:
+                    tmax = weather.get("tmax")
+                    tmin = weather.get("tmin")
+                    precip = weather.get("precip")
+                    viento = weather.get("viento")
+
+                records.append({
+                    "fecha": single_date.date().isoformat(),
+                    "empresa": info["empresa"],
+                    "linea": linea,
+                    "municipio": info["municipio"],
+                    "is_feriado": 0,
+                    "tmax": tmax,
+                    "tmin": tmin,
+                    "precip": precip,
+                    "viento": viento,
+                    "tipo_transporte": "",
+                    "provincia": info["provincia"],
+                    "tipo_feriado": "",
+                    "nombre_feriado": "",
+                    "cantidad": np.nan,
+                })
+
+        input_df = pd.DataFrame.from_records(records)
 
         try:
             with st.spinner("Procesando datos..."):
                 # Feature engineering
                 fe_output = fe_pipeline.transform(input_df)
-                
+
                 # Preprocesamiento final
                 processed = preprocessor.transform(fe_output)
-                
+
                 # Predicción
-                prediction = float(model.predict(processed)[0])
-            
+                y_pred = model.predict(processed)
+                preds = pd.Series(np.array(y_pred).ravel(), name="prediccion")
+                results = pd.concat([input_df[["municipio", "provincia", "linea", "fecha", "tmax", "tmin", "precip", "viento"]].reset_index(drop=True), preds], axis=1)
+
             st.success("✅ Predicción completada")
-            
-            # Mostrar resultado
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                st.subheader("🎯 Resultado de la predicción")
-                
-                # Si la predicción es negativa, tomar el valor absoluto y advertir
-                if prediction < 0:
-                    st.warning(
-                        f"⚠ El modelo devolvió un valor negativo ({prediction:,.0f}). "
-                        "Esto indica que los datos ingresados se alejan de los patrones vistos "
-                        "durante el entrenamiento."
-                    )
-                    prediction_display = abs(prediction)
-                    st.metric(
-                        "Pasajeros estimados (valor absoluto)", 
-                        f"{prediction_display:,.0f}",
-                        delta="Predicción ajustada"
-                    )
-                else:
-                    st.metric("Pasajeros estimados", f"{prediction:,.0f}")
-            
-            with col2:
-                st.subheader("📊 Contexto")
-                dia_nombres = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
-                dia_semana = fecha.weekday()
-                st.info(f"*Día*: {dia_nombres[dia_semana]}")
-                st.info(f"*Fin de semana*: {'Sí' if dia_semana >= 5 else 'No'}")
-                st.info(f"*Feriado*: {'Sí' if is_feriado else 'No'}")
-                
+
+            # Mostrar total en el panel derecho junto al formulario
+            if total_placeholder is not None:
+                total_pred = results["prediccion"].sum()
+                total_placeholder.markdown(
+                    f"<div style='font-size:1.8rem; font-weight:700; color:#2b8a3e;'>"
+                    f"Total estimado (rango):<br>{total_pred:,.0f} pasajeros" \
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            # Mostrar resultados por municipio (todas las fechas)
+            st.subheader("🎯 Predicción por municipio")
+            display_results = results.copy()
+            display_results["fecha"] = pd.to_datetime(display_results["fecha"])
+            display_results = display_results.sort_values(["fecha", "prediccion"], ascending=[True, False])
+            st.dataframe(
+                display_results.assign(
+                    prediccion=lambda d: d["prediccion"].round(0).astype(int)
+                ),
+                use_container_width=True,
+            )
+
+            # Gráfico de predicciones agregadas por fecha
+            st.subheader("📈 Evolución de predicciones")
+            totals_df = display_results.groupby("fecha", as_index=False)["prediccion"].sum()
+            totals_df["prediccion"] = totals_df["prediccion"].round(0)
+
+            chart = (
+                alt.Chart(totals_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("fecha:T", title="Fecha"),
+                    y=alt.Y("prediccion:Q", title="Pasajeros estimados"),
+                    tooltip=["fecha:T", alt.Tooltip("prediccion:Q", format=",.0f")],
+                )
+                .properties(width="container", height=400)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
         except Exception as exc:
             st.error(f"❌ Ocurrió un error durante la predicción: {exc}")
             st.exception(exc)
@@ -797,45 +1056,39 @@ with tab2:
     st.divider()
     
     with st.expander("ℹ Información del modelo"):
-        st.markdown("""
+        st.markdown(f"""
         ### Características del modelo
         
-        *Campos utilizados para la predicción:*
-        - 📅 *Temporales*: Fecha (día, mes, día de semana, features cíclicas)
-        - 🌡 *Climáticos*: Temperaturas (máx, mín, media, amplitud), precipitación, viento
-        - 🚌 *Servicio*: Empresa, línea, municipio
-        - 📆 *Contexto*: Es feriado, es fin de semana
+        *Campos utilizados automáticamente para cada municipio de la línea seleccionada:*
+        - 📅 *Temporales*: Fecha, día de la semana, mes, indicadores cíclicos y bandera de fin de semana.
+        - 🌡 *Clima por municipio*: Temperaturas (máx/mín/media), amplitud térmica, precipitación y viento obtenidos en tiempo real desde Open-Meteo.
+        - 🚌 *Servicio*: Línea, municipio y empresa predominante según el histórico SUBE.
+        - 📆 *Contexto*: Feriados/flags y lags (lag_1, lag_7, lag_28) si existen registros recientes en la serie.
         
-        *Campos NO utilizados* (se eliminan en el preprocesamiento):
-        - ❌ Tipo de transporte
-        - ❌ Provincia
-        - ❌ Tipo de feriado
-        - ❌ Nombre del feriado
+        *Entradas que no necesitás cargar manualmente:*
+        - ❌ Provincia, tipo/nombre de feriado o tipo de transporte (el pipeline las gestiona o descarta).
+        - ❌ Clima: se consulta automáticamente por municipio utilizando su centroide geográfico.
         
-        *Nota importante*: Este modelo NO utiliza features de lag (datos históricos previos), 
-        por lo que las predicciones se basan únicamente en patrones temporales y contextuales.
+        *Lags*: cuando hay histórico disponible se generan lags por línea+municipio; si están ausentes se imputan durante el preprocesamiento.
         """)
 
     with st.expander("⚙ Detalles técnicos"):
         st.markdown("""
         ### Pipeline de procesamiento
         
-        1. *Feature Engineering*:
-           - Conversión y ordenamiento de fechas
-           - Extracción de features temporales (día, mes, día de semana)
-           - Creación de features cíclicas (sin/cos)
-           - Cálculo de temperatura media y amplitud térmica
-           - Codificación de perfiles históricos
-           - Análisis de impacto climático
-           - Patrones estacionales
+        1. *Ingesta dinámica*:
+           - Obtención de clima diario (Open-Meteo) por municipio usando coordenadas del georef oficial.
+           - Construcción automática de registros para todos los municipios asociados a la línea elegida.
+           - Validación temporal: solo se aceptan fechas hasta 16 días después del último dato del CSV histórico.
         
-        2. *Preprocesamiento*:
-           - Eliminación de columnas no utilizadas
-           - Winsorización de outliers en variables climáticas
-           - Imputación de valores faltantes
-           - Normalización (MinMaxScaler)
-           - Encoding de variables categóricas (OneHot)
+        2. *Feature Engineering* (pipeline serializado en `fe_pipeline.joblib`):
+           - Ordenamiento temporal, extracción de calendarios, funciones cíclicas y banderas de fin de semana.
+           - Cálculo de temperatura media/amplitud, creación de lags (lag_1, lag_7, lag_28) por línea/municipio y marcadores de disponibilidad.
+           - Codificadores personalizados: perfiles históricos, sensibilidad al clima y patrones estacionales.
         
-        3. *Predicción*:
-           - Modelo: Linear Regression (según artefactos cargados)
+        3. *Preprocesamiento final* (`preprocessor.joblib`):
+           - Drop de columnas auxiliares, winsorización climática, imputaciones numéricas/categóricas, MinMaxScaler y OneHotEncoder.
+        
+        4. *Modelo*:
+           - {MODEL_NAME} entrenado en el notebook IGNA_Entrega3, reutilizado en esta app para inferir un valor por municipio y sumar el total.
         """)

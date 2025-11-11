@@ -5,3 +5,4 @@ joblib==1.4.2
 xgboost==2.0.3
 altair>=5.0.0
 numpy>=1.24.0
+requests>=2.31.0
