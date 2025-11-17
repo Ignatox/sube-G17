@@ -1,12 +1,18 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import joblib
+import io
+from pathlib import Path
+
 import altair as alt
-from datetime import datetime
+import datetime as dt
+import joblib
 import json
+import numpy as np
+import pandas as pd
 import requests
+import streamlit as st
 from datetime import date as date_cls
+from datetime import datetime
+
+WEEKDAY_NAMES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
 from sklearn.base import BaseEstimator, TransformerMixin
 
@@ -373,6 +379,9 @@ class SeasonalityEncoder(BaseEstimator, TransformerMixin):
 
 TARGET_COLUMN = "cantidad"
 REFERENCE_CSV = "final_2024-11-04.csv"
+DATA_DIR = Path("artifacts")
+PREDICTION_REFERENCE_PATH = DATA_DIR / "prediction_reference.csv"
+SUBE_DATA_URL_TEMPLATE = "https://archivos-datos.transporte.gob.ar/upload/Dat_Ab_Usos/dat-ab-usos-{year}.csv"
 
 # -------------------------------------------------------------------
 # Carga de artefactos entrenados
@@ -429,6 +438,92 @@ def load_full_data(path: str = REFERENCE_CSV):
     except Exception as e:
         st.error(f"Error cargando datos: {e}")
         return pd.DataFrame()
+
+
+def _download_remote_usage_data(year: int) -> pd.DataFrame:
+    """Descarga el CSV anual de usos SUBE desde datos.transporte."""
+    url = SUBE_DATA_URL_TEMPLATE.format(year=year)
+    resp = requests.get(url, timeout=120)
+    resp.raise_for_status()
+    return pd.read_csv(io.BytesIO(resp.content))
+
+
+def _prepare_prediction_reference(df: pd.DataFrame) -> pd.DataFrame:
+    """Filtra AMBA y deja solo las columnas necesarias para predicción."""
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df.columns = [col.strip() for col in df.columns]
+    column_map = {
+        "DIA_TRANSPORTE": "fecha",
+        "NOMBRE_EMPRESA": "empresa",
+        "LINEA": "linea",
+        "AMBA": "amba",
+        "TIPO_TRANSPORTE": "tipo_transporte",
+        "JURISDICCION": "jurisdiccion",
+        "PROVINCIA": "provincia",
+        "MUNICIPIO": "municipio",
+        "CANTIDAD": "cantidad",
+        "DATO_PRELIMINAR": "dato_preliminar",
+    }
+    df = df.rename(columns=column_map)
+
+    if "amba" in df.columns:
+        df = df[df["amba"].astype(str).str.upper() == "SI"]
+
+    keep_cols = [
+        "fecha",
+        "empresa",
+        "linea",
+        "jurisdiccion",
+        "provincia",
+        "municipio",
+        "tipo_transporte",
+        "cantidad",
+        "dato_preliminar",
+    ]
+    df = df[[col for col in keep_cols if col in df.columns]].copy()
+
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df["cantidad"] = pd.to_numeric(df["cantidad"], errors="coerce")
+    df = df.dropna(subset=["fecha", "linea", "municipio", "cantidad"])
+    df["linea"] = df["linea"].astype(str).str.strip()
+    df["municipio"] = df["municipio"].astype(str).str.strip()
+    df["empresa"] = df["empresa"].astype(str).str.strip()
+    df["provincia"] = df["provincia"].astype(str).str.strip()
+    df["cantidad"] = df["cantidad"].astype(int)
+
+    df = df.sort_values("fecha")
+    return df
+
+
+@st.cache_data(show_spinner=True)
+def load_prediction_reference(refresh_key: str):
+    """Descarga (o reutiliza) el dataset de usos SUBE para predicción."""
+    _ = refresh_key  # fuerza la invalidación diaria del caché
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    current_year = pd.Timestamp.today().year
+    errors = []
+
+    for year in (current_year, current_year - 1):
+        try:
+            remote_df = _download_remote_usage_data(year)
+            prepared = _prepare_prediction_reference(remote_df)
+            if not prepared.empty:
+                prepared.to_csv(PREDICTION_REFERENCE_PATH, index=False)
+                return prepared
+        except Exception as exc:
+            errors.append(str(exc))
+
+    # Fallback to local copy if network fails
+    if PREDICTION_REFERENCE_PATH.exists():
+        cached = pd.read_csv(PREDICTION_REFERENCE_PATH, parse_dates=["fecha"])
+        return cached
+
+    raise RuntimeError(
+        "No se pudo descargar el dataset actualizado. Errores: " + " | ".join(errors)
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -982,6 +1077,9 @@ def create_prediction_timeline_interactive(results_df):
     
     results_df = results_df.copy()
     results_df['fecha'] = pd.to_datetime(results_df['fecha'])
+    results_df['dia_semana'] = results_df['fecha'].dt.dayofweek.map(
+        lambda idx: WEEKDAY_NAMES[idx] if pd.notna(idx) and int(idx) < len(WEEKDAY_NAMES) else ""
+    )
     
     # OPTIMIZACIÓN: Si hay muchos municipios (>10), mostrar solo top 10 por predicción total
     num_munis = results_df['municipio'].nunique()
@@ -1017,6 +1115,7 @@ def create_prediction_timeline_interactive(results_df):
         strokeWidth=alt.condition(municipio_selection, alt.value(3), alt.value(1)),
         tooltip=[
             alt.Tooltip('fecha:T', format='%Y-%m-%d', title='Fecha'),
+            alt.Tooltip('dia_semana:N', title='Día'),
             alt.Tooltip('municipio:N', title='Municipio'),
             alt.Tooltip('prediccion:Q', format=',.0f', title='Pasajeros')
         ]
@@ -1037,6 +1136,7 @@ def create_prediction_timeline_interactive(results_df):
         color=alt.value('#2b8a3e'),
         tooltip=[
             alt.Tooltip('fecha:T', format='%Y-%m-%d', title='Fecha'),
+            alt.Tooltip('dia_semana:N', title='Día'),
             alt.Tooltip('prediccion:Q', format=',.0f', title='Total Pasajeros')
         ]
     ).add_params(click).properties(
@@ -1055,6 +1155,7 @@ def create_prediction_timeline_interactive(results_df):
         color=alt.Color('municipio:N', scale=alt.Scale(scheme='category20'), legend=None),
         tooltip=[
             alt.Tooltip('municipio:N', title='Municipio'),
+            alt.Tooltip('dia_semana:N', title='Día'),
             alt.Tooltip('prediccion:Q', format=',.0f', aggregate='sum', title='Pasajeros')
         ]
     ).transform_filter(click).properties(
@@ -1062,8 +1163,166 @@ def create_prediction_timeline_interactive(results_df):
         width=800,
         height=250
     )
+
+    # Panel 4: Condiciones climáticas promedio para la fecha seleccionada
+    climate_chart = (
+        alt.Chart(results_df)
+        .transform_fold(
+            ["tmax", "tmin", "precip", "viento"],
+            as_=["variable", "valor"],
+        )
+        .transform_filter(click)
+        .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=alt.X(
+                "variable:N",
+                title="Variable",
+                sort=["tmax", "tmin", "precip", "viento"],
+            ),
+            y=alt.Y(
+                "valor:Q",
+                aggregate="mean",
+                title="Valor medio (fecha seleccionada)",
+                scale=alt.Scale(zero=False),
+            ),
+            color=alt.Color(
+                "variable:N",
+                scale=alt.Scale(
+                    domain=["tmax", "tmin", "precip", "viento"],
+                    range=["#d62728", "#1f77b4", "#9467bd", "#2ca02c"],
+                ),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("fecha:T", format="%Y-%m-%d", title="Fecha"),
+                alt.Tooltip("dia_semana:N", title="Día"),
+                alt.Tooltip("variable:N", title="Variable"),
+                alt.Tooltip("mean(valor):Q", format=",.2f", title="Valor"),
+            ],
+        )
+        .properties(
+            title="🌡️ Condiciones climáticas del día seleccionado",
+            width=800,
+            height=220,
+        )
+    )
     
-    return alt.vconcat(total_chart, lines_chart, detail_chart).resolve_scale(color='independent')
+    return alt.vconcat(total_chart, lines_chart, detail_chart, climate_chart).resolve_scale(color='independent')
+
+
+def create_prediction_total_chart(results_df):
+    """Línea de tiempo agregada para el total de pasajeros predichos."""
+    if results_df.empty:
+        return None
+
+    totals_df = (
+        results_df.assign(fecha=pd.to_datetime(results_df["fecha"]))
+        .groupby("fecha", as_index=False)["prediccion"]
+        .sum()
+    )
+    totals_df["dia_semana"] = totals_df["fecha"].dt.dayofweek.map(
+        lambda idx: WEEKDAY_NAMES[idx] if pd.notna(idx) and int(idx) < len(WEEKDAY_NAMES) else ""
+    )
+
+    return (
+        alt.Chart(totals_df)
+        .mark_line(point=True, strokeWidth=3)
+        .encode(
+            x=alt.X("fecha:T", title="Fecha", axis=alt.Axis(format="%Y-%m-%d")),
+            y=alt.Y("prediccion:Q", title="Pasajeros estimados", scale=alt.Scale(zero=False)),
+            tooltip=[
+                alt.Tooltip("fecha:T", format="%Y-%m-%d", title="Fecha"),
+                alt.Tooltip("dia_semana:N", title="Día"),
+                alt.Tooltip("prediccion:Q", format=",.0f", title="Total pasajeros"),
+            ],
+        )
+        .properties(title="🧮 Total combinado de pasajeros", width=800, height=320)
+    )
+
+
+def create_prediction_total_with_climate(results_df):
+    """Vista simplificada con total diario y clima asociado."""
+    if results_df.empty:
+        return None
+
+    df = results_df.copy()
+    df["fecha"] = pd.to_datetime(df["fecha"])
+    agg = (
+        df.groupby("fecha", as_index=False)
+        .agg(
+            prediccion=("prediccion", "sum"),
+            tmax=("tmax", "mean"),
+            tmin=("tmin", "mean"),
+            precip=("precip", "mean"),
+            viento=("viento", "mean"),
+        )
+        .fillna(np.nan)
+    )
+    agg["dia_semana"] = agg["fecha"].dt.dayofweek.map(
+        lambda idx: WEEKDAY_NAMES[idx] if pd.notna(idx) and int(idx) < len(WEEKDAY_NAMES) else ""
+    )
+
+    click = alt.selection_point(fields=["fecha"], empty=True)
+
+    total_chart = (
+        alt.Chart(agg)
+        .mark_line(point=True, strokeWidth=3)
+        .encode(
+            x=alt.X("fecha:T", title="Fecha", axis=alt.Axis(format="%Y-%m-%d")),
+            y=alt.Y("prediccion:Q", title="Pasajeros estimados", scale=alt.Scale(zero=False)),
+            tooltip=[
+                alt.Tooltip("fecha:T", format="%Y-%m-%d", title="Fecha"),
+                alt.Tooltip("dia_semana:N", title="Día"),
+                alt.Tooltip("prediccion:Q", format=",.0f", title="Total pasajeros"),
+                alt.Tooltip("tmax:Q", format=",.1f", title="T° Máx"),
+                alt.Tooltip("tmin:Q", format=",.1f", title="T° Mín"),
+                alt.Tooltip("precip:Q", format=",.1f", title="Precip (mm)"),
+                alt.Tooltip("viento:Q", format=",.1f", title="Viento (km/h)"),
+            ],
+        )
+        .add_params(click)
+        .properties(width=800, height=320, title="🧮 Total diario de pasajeros")
+    )
+
+    climate_chart = (
+        alt.Chart(agg)
+        .transform_fold(
+            ["tmax", "tmin", "precip", "viento"],
+            as_=["variable", "valor"],
+        )
+        .transform_filter(click)
+        .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=alt.X("variable:N", title="Variable", sort=["tmax", "tmin", "precip", "viento"]),
+            y=alt.Y(
+                "valor:Q",
+                aggregate="mean",
+                title="Valor (fecha seleccionada)",
+                scale=alt.Scale(zero=False),
+            ),
+            color=alt.Color(
+                "variable:N",
+                scale=alt.Scale(
+                    domain=["tmax", "tmin", "precip", "viento"],
+                    range=["#d62728", "#1f77b4", "#9467bd", "#2ca02c"],
+                ),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("fecha:T", format="%Y-%m-%d", title="Fecha"),
+                alt.Tooltip("dia_semana:N", title="Día"),
+                alt.Tooltip("variable:N", title="Variable"),
+                alt.Tooltip("mean(valor):Q", format=",.2f", title="Valor"),
+            ],
+        )
+        .properties(
+            width=800,
+            height=220,
+            title="🌡️ Condiciones climáticas del día seleccionado",
+        )
+    )
+
+    return alt.vconcat(total_chart, climate_chart)
 
 
 def create_prediction_weather_comparison(results_df):
@@ -1279,6 +1538,29 @@ tab1, tab2 = st.tabs(["📊 Exploración de Datos", "🔮 Predicción"])
 fe_pipeline, preprocessor, model = load_artifacts()
 reference = load_reference_data()
 df_full = load_full_data()
+prediction_refresh_key = pd.Timestamp.today().strftime("%Y-%m-%d")
+try:
+    df_prediction_ref = load_prediction_reference(prediction_refresh_key)
+except Exception as prediction_error:
+    st.warning(
+        f"No se pudieron descargar los datos actualizados de SUBE ({prediction_error}). "
+        "Se continuará utilizando únicamente el dataset local."
+    )
+    df_prediction_ref = pd.DataFrame()
+
+df_prediction_source = df_prediction_ref if not df_prediction_ref.empty else df_full
+if not df_full.empty and not df_prediction_source.empty:
+    valid_lines = set(df_full["linea"].astype(str).unique())
+    original_count = len(df_prediction_source)
+    df_prediction_source = df_prediction_source[
+        df_prediction_source["linea"].astype(str).isin(valid_lines)
+    ].copy()
+    filtered_count = len(df_prediction_source)
+    if filtered_count < original_count:
+        st.info(
+            "Algunas líneas recientes no están presentes en el dataset base 2024, "
+            "por lo que fueron excluidas de las predicciones."
+        )
 
 # Intentar cargar metadata del modelo para mostrar nombre/modelo
 try:
@@ -1319,7 +1601,7 @@ with tab1:
         """)
         chart_interactive = create_interactive_demand_explorer(df_full)
         if chart_interactive:
-            st.altair_chart(chart_interactive, width='stretch')
+            st.altair_chart(chart_interactive, use_container_width=True)
         
         st.divider()
         
@@ -1333,7 +1615,7 @@ with tab1:
         """)
         chart_heatmap = create_heatmap_interactive(df_full)
         if chart_heatmap:
-            st.altair_chart(chart_heatmap, width='stretch')
+            st.altair_chart(chart_heatmap, use_container_width=True)
         
         st.divider()
         
@@ -1347,7 +1629,7 @@ with tab1:
         """)
         chart_weather = create_weather_scatter_matrix(df_full)
         if chart_weather:
-            st.altair_chart(chart_weather, width='stretch')
+            st.altair_chart(chart_weather, use_container_width=True)
         
         st.divider()
         
@@ -1361,7 +1643,7 @@ with tab1:
         """)
         chart_lines = create_multi_line_selector(df_full)
         if chart_lines:
-            st.altair_chart(chart_lines, width='stretch')
+            st.altair_chart(chart_lines, use_container_width=True)
         
         st.divider()
         
@@ -1372,7 +1654,7 @@ with tab1:
         """)
         chart_temporal = create_temporal_distribution_chart(df_full)
         if chart_temporal:
-            st.altair_chart(chart_temporal, width='stretch')
+            st.altair_chart(chart_temporal, use_container_width=True)
         
         st.divider()
         
@@ -1386,7 +1668,7 @@ with tab1:
         """)
         chart_dashboard = create_interactive_dashboard(df_full)
         if chart_dashboard:
-            st.altair_chart(chart_dashboard, width='stretch')
+            st.altair_chart(chart_dashboard, use_container_width=True)
         
         st.divider()
         
@@ -1402,7 +1684,10 @@ with tab1:
             with col4:
                 st.metric("Líneas Únicas", f"{df_full['linea'].nunique():,}")
             
-            st.dataframe(df_full[['cantidad', 't_med', 'precip', 'viento']].describe(), width='stretch')
+            st.dataframe(
+                df_full[['cantidad', 't_med', 'precip', 'viento']].describe(),
+                use_container_width=True,
+            )
 
 # ============================================================================
 # TAB 2: PREDICCIÓN (MEJORADO)
@@ -1418,7 +1703,17 @@ with tab2:
     st.subheader("📋 Ingresá los datos")
     st.caption("Elegí la fecha y la línea. La app predecirá para todos los municipios de esa línea.")
 
-    line_opts = get_line_options(df_full)
+    line_opts = get_line_options(df_prediction_source)
+    prediction_last_date = (
+        pd.to_datetime(df_prediction_source["fecha"].max())
+        if not df_prediction_source.empty
+        else None
+    )
+    if prediction_last_date is not None:
+        st.caption(
+            f"Último dato SUBE (AMBA): {prediction_last_date.date()} • "
+            "La predicción permite hasta 16 días posteriores."
+        )
 
     total_placeholder = None
     with st.form("prediction_form"):
@@ -1427,15 +1722,32 @@ with tab2:
         with col_left:
             st.markdown("### 📍 Selección")
             # Fechas con validación contra último dato del CSV (+16 días)
-            last_date = pd.to_datetime(df_full['fecha'].max()) if not df_full.empty else pd.Timestamp.today()
+            last_date = prediction_last_date if prediction_last_date is not None else pd.Timestamp.today()
             max_allowed = (last_date + pd.Timedelta(days=16)).date()
-            default_start = min((last_date + pd.Timedelta(days=1)).date(), max_allowed) if not df_full.empty else pd.Timestamp.today().date()
-            fecha_desde = st.date_input("Fecha desde", value=default_start, max_value=max_allowed)
+            default_start = min((last_date + pd.Timedelta(days=1)).date(), max_allowed) if not df_prediction_source.empty else pd.Timestamp.today().date()
+            fecha_desde = st.date_input(
+                "Fecha desde",
+                value=default_start,
+                max_value=max_allowed,
+                key="prediction_fecha_desde",
+            )
+
+            fecha_hasta_key = "prediction_fecha_hasta"
+            stored_hasta = st.session_state.get(fecha_hasta_key)
+            if isinstance(stored_hasta, dt.date):
+                if stored_hasta < fecha_desde:
+                    st.session_state[fecha_hasta_key] = fecha_desde
+                elif stored_hasta > max_allowed:
+                    st.session_state[fecha_hasta_key] = max_allowed
+            else:
+                st.session_state.pop(fecha_hasta_key, None)
+
             fecha_hasta = st.date_input(
                 "Predecir hasta",
                 value=default_start,
                 min_value=fecha_desde,
                 max_value=max_allowed,
+                key=fecha_hasta_key,
             )
             linea = st.selectbox("Línea", options=line_opts, index=0)
 
@@ -1448,7 +1760,7 @@ with tab2:
 
     if submitted:
         # Validación de fechas
-        last_date = pd.to_datetime(df_full['fecha'].max()) if not df_full.empty else pd.Timestamp.today()
+        last_date = prediction_last_date if prediction_last_date is not None else pd.Timestamp.today()
         max_limit = last_date + pd.Timedelta(days=16)
         fecha_desde_ts = pd.Timestamp(fecha_desde)
         fecha_hasta_ts = pd.Timestamp(fecha_hasta)
@@ -1465,7 +1777,7 @@ with tab2:
             st.stop()
 
         # Municipios para la línea seleccionada
-        municipios = get_municipios_for_line(df_full, linea)
+        municipios = get_municipios_for_line(df_prediction_source, linea)
         if not municipios:
             st.warning("No se encontraron municipios para la línea seleccionada en el CSV.")
             st.stop()
@@ -1473,8 +1785,8 @@ with tab2:
         # Precalcular info por municipio
         muni_info = []
         for muni in municipios:
-            prov = get_default_provincia_for_line_muni(df_full, linea, muni)
-            emp = get_default_empresa_for_line_muni(df_full, linea, muni)
+            prov = get_default_provincia_for_line_muni(df_prediction_source, linea, muni)
+            emp = get_default_empresa_for_line_muni(df_prediction_source, linea, muni)
             lat, lon = fetch_municipio_centroid(muni, prov)
             muni_info.append({
                 "municipio": muni,
@@ -1544,50 +1856,76 @@ with tab2:
                     unsafe_allow_html=True,
                 )
 
-            # Mostrar resultados por municipio (todas las fechas)
-            st.subheader("🎯 Predicción por municipio")
             display_results = results.copy()
             display_results["fecha"] = pd.to_datetime(display_results["fecha"])
             display_results = display_results.sort_values(["fecha", "prediccion"], ascending=[True, False])
-            st.dataframe(
-                display_results.assign(
-                    prediccion=lambda d: d["prediccion"].round(0).astype(int)
-                ),
-                width='stretch',
-            )
+            multiple_municipios = display_results["municipio"].nunique() > 1
 
-            # NUEVOS GRÁFICOS INTERACTIVOS DE PREDICCIÓN
+            if multiple_municipios:
+                st.subheader("🎯 Predicción por municipio")
+                st.dataframe(
+                    display_results.assign(
+                        prediccion=lambda d: d["prediccion"].round(0).astype(int)
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.subheader("📈 Predicción por fecha")
+                st.caption("Esta línea solo presenta un municipio, por lo que no se muestra el desglose.")
+                fecha_summary = (
+                    display_results.groupby("fecha", as_index=False)["prediccion"]
+                    .sum()
+                    .assign(prediccion=lambda d: d["prediccion"].round(0).astype(int))
+                )
+                st.dataframe(fecha_summary, use_container_width=True)
             
-            # Gráfico 1: Timeline interactivo con desglose
-            st.subheader("📊 Predicciones Interactivas por Municipio")
-            st.markdown("""
-            **Click en la leyenda para filtrar municipios, click en una fecha para ver detalles**
-            """)
-            chart_pred_timeline = create_prediction_timeline_interactive(display_results)
-            if chart_pred_timeline:
-                st.altair_chart(chart_pred_timeline, width='stretch')
-            
-            st.divider()
-            
-            # Gráfico 2: Comparación con clima
-            st.subheader("🌦️ Predicciones vs Condiciones Climáticas")
-            st.markdown("""
-            **Explora cómo las predicciones se relacionan con el clima. Click en puntos para destacarlos.**
-            """)
-            chart_pred_weather = create_prediction_weather_comparison(display_results)
-            if chart_pred_weather:
-                st.altair_chart(chart_pred_weather, width='stretch')
-            
-            st.divider()
-            
-            # Gráfico 3: Heatmap de predicciones
-            st.subheader("🔥 Heatmap de Predicciones")
-            st.markdown("""
-            **Vista general de todas las predicciones por municipio y fecha**
-            """)
-            chart_pred_heatmap = create_prediction_heatmap(display_results)
-            if chart_pred_heatmap:
-                st.altair_chart(chart_pred_heatmap, width='stretch')
+            chart_pred_total = create_prediction_total_chart(display_results)
+            chart_total_climate = create_prediction_total_with_climate(display_results)
+
+            if multiple_municipios:
+                # Gráfico 1: Timeline interactivo con desglose
+                st.subheader("📊 Predicciones Interactivas por Municipio")
+                st.markdown("""
+                **Click en la leyenda para filtrar municipios, click en una fecha para ver detalles**
+                """)
+                chart_pred_timeline = create_prediction_timeline_interactive(display_results)
+                if chart_pred_timeline:
+                    st.altair_chart(chart_pred_timeline, use_container_width=True)
+
+                if chart_pred_total:
+                    st.divider()
+                    st.subheader("🧮 Total combinado por fecha")
+                    st.altair_chart(chart_pred_total, use_container_width=True)
+                
+                st.divider()
+                
+                # Gráfico 2: Comparación con clima
+                st.subheader("🌦️ Predicciones vs Condiciones Climáticas")
+                st.markdown("""
+                **Explora cómo las predicciones se relacionan con el clima. Click en puntos para destacarlos.**
+                """)
+                chart_pred_weather = create_prediction_weather_comparison(display_results)
+                if chart_pred_weather:
+                    st.altair_chart(chart_pred_weather, use_container_width=True)
+                
+                st.divider()
+                
+                # Gráfico 3: Heatmap de predicciones
+                st.subheader("🔥 Heatmap de Predicciones")
+                st.markdown("""
+                **Vista general de todas las predicciones por municipio y fecha**
+                """)
+                chart_pred_heatmap = create_prediction_heatmap(display_results)
+                if chart_pred_heatmap:
+                    st.altair_chart(chart_pred_heatmap, use_container_width=True)
+            else:
+                if chart_total_climate:
+                    st.subheader("🧮 Total de pasajeros y clima")
+                    st.altair_chart(chart_total_climate, use_container_width=True)
+                elif chart_pred_total:
+                    st.subheader("🧮 Total de pasajeros estimados")
+                    st.altair_chart(chart_pred_total, use_container_width=True)
+                st.info("No se muestran gráficos con desglose porque la línea solo incluye un municipio.")
 
         except Exception as exc:
             st.error(f"❌ Ocurrió un error durante la predicción: {exc}")
@@ -1632,4 +1970,3 @@ with tab2:
         4. *Modelo*:
            - {MODEL_NAME} entrenado en el notebook IGNA_Entrega3, reutilizado en esta app para inferir un valor por municipio y sumar el total.
         """)
-

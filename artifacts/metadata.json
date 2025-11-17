@@ -1,5 +1,5 @@
 {
-  "model_name": "Linear Regression",
+  "model_name": "XGBoost",
   "date_col": "fecha",
   "target_col": "cantidad",
   "requires_history": false,
@@ -20,8 +20,8 @@
   ],
   "sklearn_version": "1.7.2",
   "metrics": {
-    "valid_rmse": 18319.700950637405,
-    "valid_r2": 0.07059719342659021,
-    "training_time_seconds": 0.501936674118042
+    "valid_rmse": 4435.222655064794,
+    "valid_r2": 0.9460533261299133,
+    "training_time_seconds": 8.267021417617798
   }
 }
