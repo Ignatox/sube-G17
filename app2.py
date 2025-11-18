@@ -703,10 +703,83 @@ def fetch_daily_weather(lat: float, lon: float, fecha: pd.Timestamp):
 # NUEVAS FUNCIONES DE VISUALIZACIÓN INTERACTIVA
 # ============================================================================
 
+MONTH_NAMES_FULL = [
+    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+]
+MONTH_NAME_TO_NUMBER = {name: idx + 1 for idx, name in enumerate(MONTH_NAMES_FULL)}
 
-def create_interactive_demand_explorer(df):
+
+def render_global_filter_panel(df):
+    """Renderiza filtros globales (municipio/mes) anclados en la barra lateral."""
+    required_cols = {"fecha", "municipio"}
+    if df.empty or not required_cols.issubset(df.columns):
+        return None, "Todos"
+
+    data = df[list(required_cols)].dropna(subset=["fecha", "municipio"]).copy()
+    if data.empty:
+        return None, "Todos"
+
+    if not pd.api.types.is_datetime64_any_dtype(data["fecha"]):
+        data["fecha"] = pd.to_datetime(data["fecha"], errors="coerce")
+    data = data.dropna(subset=["fecha"])
+    if data.empty:
+        return None, "Todos"
+
+    data["mes_nombre"] = data["fecha"].dt.month.map(
+        lambda m: MONTH_NAMES_FULL[int(m) - 1] if pd.notna(m) else None
+    )
+
+    municipios = sorted(data["municipio"].dropna().unique().tolist())
+    if not municipios:
+        return None, "Todos"
+
+    with st.sidebar:
+        st.markdown("### 📌 Filtros globales")
+        st.caption("Estos filtros permanecen visibles mientras navegás el dashboard.")
+
+        default_municipio_index = 0
+        stored_muni = st.session_state.get("global_municipio")
+        if stored_muni in municipios:
+            default_municipio_index = municipios.index(stored_muni)
+
+        selected_municipio = st.selectbox(
+            "Municipio",
+            municipios,
+            index=default_municipio_index,
+            key="global_municipio",
+        )
+
+        available_months = data.loc[
+            data["municipio"] == selected_municipio, "mes_nombre"
+        ].dropna().unique().tolist()
+        ordered_months = [m for m in MONTH_NAMES_FULL if m in available_months]
+        month_options = ["Todos"] + ordered_months
+
+        month_key = "global_mes"
+        stored_month = st.session_state.get(month_key)
+        if stored_month not in month_options:
+            st.session_state[month_key] = month_options[0]
+
+        selected_month = st.selectbox(
+            "Mes (opcional)",
+            month_options,
+            key=month_key,
+        )
+
+    return selected_municipio, selected_month
+
+
+def create_interactive_demand_explorer(
+    df,
+    return_filters=False,
+    preselected=None,
+    show_selectors=True,
+):
     """
     Explorador interactivo (Gráfico 1) con filtros previos de Streamlit.
+
+    Si `return_filters` es True, devuelve una tupla (chart, filtros_seleccionados).
     """
     if df.empty:
         return None
@@ -743,36 +816,53 @@ def create_interactive_demand_explorer(df):
         .rename(columns={"fecha_mes": "fecha"})
     )
 
-    month_names = [
-        "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-        "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
-    ]
     muni_month["mes_nombre"] = muni_month["fecha"].dt.month.map(
-        lambda m: month_names[int(m) - 1] if pd.notna(m) else None
+        lambda m: MONTH_NAMES_FULL[int(m) - 1] if pd.notna(m) else None
     )
     line_month["mes_nombre"] = line_month["fecha"].dt.month.map(
-        lambda m: month_names[int(m) - 1] if pd.notna(m) else None
+        lambda m: MONTH_NAMES_FULL[int(m) - 1] if pd.notna(m) else None
     )
 
     municipios = sorted(muni_month["municipio"].dropna().unique().tolist())
     if not municipios:
         return None
 
-    col_left, col_right = st.columns(2)
-    with col_left:
-        selected_municipio = st.selectbox(
-            "Municipio", municipios, index=0, key="explorer_municipio"
-        )
+    preselected = preselected or {}
+    selected_municipio = preselected.get("municipio")
+
+    if selected_municipio not in municipios:
+        selected_municipio = municipios[0]
+
+    if show_selectors:
+        col_left, col_right = st.columns(2)
+        with col_left:
+            selected_municipio = st.selectbox(
+                "Municipio",
+                municipios,
+                index=municipios.index(selected_municipio),
+                key="explorer_municipio",
+            )
+    else:
+        col_right = col_left = None
 
     available_months = muni_month.loc[
         muni_month["municipio"] == selected_municipio, "mes_nombre"
     ].dropna().unique().tolist()
-    ordered_months = [m for m in month_names if m in available_months]
+    ordered_months = [m for m in MONTH_NAMES_FULL if m in available_months]
     month_options = ["Todos"] + ordered_months
-    with col_right:
-        selected_month = st.selectbox(
-            "Mes (opcional)", month_options, index=0, key="explorer_mes"
-        )
+
+    selected_month = preselected.get("mes", "Todos")
+    if selected_month not in month_options:
+        selected_month = month_options[0]
+
+    if show_selectors:
+        with col_right:
+            selected_month = st.selectbox(
+                "Mes (opcional)",
+                month_options,
+                index=month_options.index(selected_month),
+                key="explorer_mes",
+            )
 
     muni_filtered = muni_month[muni_month["municipio"] == selected_municipio].copy()
     line_filtered = line_month[line_month["municipio"] == selected_municipio].copy()
@@ -886,16 +976,37 @@ def create_interactive_demand_explorer(df):
         )
     )
 
-    return alt.vconcat(timeline, detail_chart).resolve_scale(color="independent")
+    combined_chart = alt.vconcat(timeline, detail_chart).resolve_scale(color="independent")
+
+    if return_filters:
+        return combined_chart, {
+            "municipio": selected_municipio,
+            "mes": selected_month,
+        }
+
+    return combined_chart
 
 
-def create_heatmap_interactive(df):
-    """Heatmap interactivo simplificado"""
+def create_heatmap_interactive(df, selected_municipio=None, selected_month=None):
+    """Heatmap interactivo simplificado filtrado por municipio/mes si se provee."""
     if df.empty:
         return None
-    
+
+    filtered = df.copy()
+
+    if selected_municipio and "municipio" in filtered.columns:
+        filtered = filtered[filtered["municipio"] == selected_municipio]
+
+    if selected_month and selected_month != "Todos":
+        month_number = MONTH_NAME_TO_NUMBER.get(selected_month)
+        if month_number is not None and "mes" in filtered.columns:
+            filtered = filtered[filtered["mes"] == month_number]
+
+    if filtered.empty or not {"mes", "dia_semana", "cantidad"}.issubset(filtered.columns):
+        return None
+
     # Preparar datos agregados por mes y día (promedio general)
-    heatmap_data = df.groupby(['mes', 'dia_semana'])['cantidad'].mean().reset_index()
+    heatmap_data = filtered.groupby(['mes', 'dia_semana'])['cantidad'].mean().reset_index()
     
     dia_nombres = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
     mes_nombres = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 
@@ -939,16 +1050,33 @@ def create_heatmap_interactive(df):
     return heatmap
 
 
-def create_weather_scatter_matrix(df):
-    """Scatter matrix simplificado con variables climáticas"""
+def create_weather_scatter_matrix(df, selected_municipio=None, selected_month=None):
+    """Scatter matrix simplificado con variables climáticas filtrado por municipio/mes."""
     if df.empty:
         return None
-    
+
+    filtered = df.copy()
+
+    if selected_municipio and "municipio" in filtered.columns:
+        filtered = filtered[filtered["municipio"] == selected_municipio]
+
+    if not pd.api.types.is_datetime64_any_dtype(filtered["fecha"]):
+        filtered["fecha"] = pd.to_datetime(filtered["fecha"], errors="coerce")
+        filtered = filtered.dropna(subset=["fecha"])
+
+    if selected_month and selected_month != "Todos":
+        month_number = MONTH_NAME_TO_NUMBER.get(selected_month)
+        if month_number is not None:
+            filtered = filtered[filtered["fecha"].dt.month == month_number]
+
+    if filtered.empty:
+        return None
+
     # OPTIMIZACIÓN: Agregar por semana si hay muchos datos
-    num_records = df.groupby(['municipio', 'fecha']).size().shape[0]
+    num_records = filtered.groupby(['municipio', 'fecha']).size().shape[0]
     if num_records > 5000:
-        df['fecha_semana'] = df['fecha'].dt.to_period('W').dt.to_timestamp()
-        scatter_data = df.groupby(['fecha_semana']).agg({
+        filtered['fecha_semana'] = filtered['fecha'].dt.to_period('W').dt.to_timestamp()
+        scatter_data = filtered.groupby(['fecha_semana']).agg({
             'cantidad': 'sum',
             't_med': 'mean',
             'precip': 'mean',
@@ -956,7 +1084,7 @@ def create_weather_scatter_matrix(df):
         }).reset_index()
         scatter_data.rename(columns={'fecha_semana': 'fecha'}, inplace=True)
     else:
-        scatter_data = df.groupby('fecha').agg({
+        scatter_data = filtered.groupby('fecha').agg({
             'cantidad': 'sum',
             't_med': 'mean',
             'precip': 'mean',
@@ -1010,7 +1138,11 @@ def create_weather_scatter_matrix(df):
     ).encode(
         x=alt.X('viento:Q', title='Viento (km/h)', scale=alt.Scale(zero=False)),
         y=alt.Y('cantidad:Q', title='Pasajeros', scale=alt.Scale(zero=False)),
-        color=alt.Color('t_med:Q', scale=alt.Scale(scheme='viridis'), legend=None),
+        color=alt.Color(
+            't_med:Q',
+            scale=alt.Scale(scheme='viridis'),
+            legend=alt.Legend(title='Temp (°C)')
+        ),
         tooltip=[
             alt.Tooltip('fecha:T', format='%Y-%m-%d'),
             alt.Tooltip('viento:Q', format='.1f', title='Viento (km/h)'),
@@ -1023,158 +1155,13 @@ def create_weather_scatter_matrix(df):
         height=250
     )
     
-    return alt.hconcat(temp_chart, precip_chart, viento_chart).resolve_scale(color='independent')
-
-
-def show_municipality_comparator(df):
-    """Comparador entre dos municipios con métricas clave."""
-    required_cols = {"fecha", "municipio", "cantidad"}
-    if df.empty or not required_cols.issubset(df.columns):
-        st.warning("No hay datos suficientes para el comparador de municipios.")
-        return
-
-    data = df[list(required_cols)].dropna(subset=["fecha", "municipio"]).copy()
-    if data.empty:
-        st.warning("No hay datos suficientes para el comparador de municipios.")
-        return
-
-    if not pd.api.types.is_datetime64_any_dtype(data["fecha"]):
-        data["fecha"] = pd.to_datetime(data["fecha"], errors="coerce")
-    data = data.dropna(subset=["fecha"])
-
-    top_munis = (
-        data.groupby("municipio")["cantidad"]
-        .sum()
-        .sort_values(ascending=False)
-        .head(20)
-        .index.tolist()
-    )
-    if len(top_munis) < 2:
-        st.warning("Se necesitan al menos dos municipios para comparar.")
-        return
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        muni_a = st.selectbox(
-            "Municipio A",
-            options=top_munis,
-            index=0,
-            key="comp_muni_a",
-            help="Municipio base para la comparación",
-        )
-    with col_b:
-        default_b = 1 if len(top_munis) > 1 else 0
-        muni_b = st.selectbox(
-            "Municipio B",
-            options=top_munis,
-            index=default_b,
-            key="comp_muni_b",
-            help="Municipio contra el cual comparar",
-        )
-
-    if muni_a == muni_b:
-        st.info("Seleccioná dos municipios distintos para ver la comparación.")
-        return
-
-    compare_data = data[data["municipio"].isin([muni_a, muni_b])].copy()
-    daily = (
-        compare_data.groupby(["fecha", "municipio"])["cantidad"]
-        .sum()
-        .reset_index()
-    )
-
-    pivot = (
-        daily.pivot(index="fecha", columns="municipio", values="cantidad")
-        .fillna(0)
-        .sort_index()
-    )
-    pivot["diferencia"] = pivot[muni_a] - pivot[muni_b]
-    pivot = pivot.reset_index()
-
-    timeline_chart = (
-        alt.Chart(daily)
-        .mark_line(point=True, strokeWidth=3)
-        .encode(
-            x=alt.X("fecha:T", title="Fecha"),
-            y=alt.Y("cantidad:Q", title="Pasajeros"),
-            color=alt.Color(
-                "municipio:N",
-                title="Municipio",
-                scale=alt.Scale(
-                    domain=[muni_a, muni_b],
-                    range=["#1f77b4", "#ff7f0e"],
-                ),
-            ),
-            tooltip=[
-                alt.Tooltip("fecha:T", title="Fecha", format="%Y-%m-%d"),
-                alt.Tooltip("municipio:N", title="Municipio"),
-                alt.Tooltip("cantidad:Q", title="Pasajeros", format=",.0f"),
-            ],
-        )
-        .properties(width=900, height=320, title="📈 Evolución diaria comparada")
-    )
-
-    diff_chart = (
-        alt.Chart(pivot)
-        .mark_bar()
-        .encode(
-            x=alt.X("fecha:T", title="Fecha"),
-            y=alt.Y("diferencia:Q", title=f"Δ Pasajeros ({muni_a} - {muni_b})"),
-            color=alt.condition(
-                alt.datum.diferencia >= 0,
-                alt.value("#2b8a3e"),
-                alt.value("#c70039"),
-            ),
-            tooltip=[
-                alt.Tooltip("fecha:T", title="Fecha", format="%Y-%m-%d"),
-                alt.Tooltip("diferencia:Q", title="Diferencia", format=",.0f"),
-            ],
-        )
-        .properties(width=900, height=200, title="↕️ Diferencia diaria de pasajeros")
-    )
-
-    stats = (
-        compare_data.groupby("municipio")["cantidad"]
-        .agg(total="sum", promedio="mean", maximo="max")
-        .loc[[muni_a, muni_b]]
-    )
-    stats["promedio"] = stats["promedio"].round(0)
-    stats["maximo"] = stats["maximo"].round(0)
-
-    diff_total = stats.loc[muni_a, "total"] - stats.loc[muni_b, "total"]
-    diff_avg = stats.loc[muni_a, "promedio"] - stats.loc[muni_b, "promedio"]
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(
-            f"Total {muni_a}",
-            f"{stats.loc[muni_a, 'total']:,.0f}",
-            delta=f"{diff_total:,.0f}",
-            delta_color="normal",
-        )
-    with col2:
-        st.metric(
-            f"Total {muni_b}",
-            f"{stats.loc[muni_b, 'total']:,.0f}",
-            delta=f"{-diff_total:,.0f}",
-            delta_color="inverse",
-        )
-    with col3:
-        st.metric(
-            f"Promedio diario {muni_a}",
-            f"{stats.loc[muni_a, 'promedio']:,.0f}",
-            delta=f"{diff_avg:,.0f}",
-            delta_color="normal",
-        )
-    with col4:
-        st.metric(
-            f"Pico diario {muni_a}",
-            f"{stats.loc[muni_a, 'maximo']:,.0f}",
-            help="Mayor cantidad diaria registrada",
-        )
-
-    st.altair_chart(timeline_chart, use_container_width=True)
-    st.altair_chart(diff_chart, use_container_width=True)
+    return alt.concat(
+        temp_chart,
+        precip_chart,
+        viento_chart,
+        columns=2,
+        spacing=20,
+    ).resolve_scale(color='independent')
 
 
 def show_contribution_insights(df):
@@ -1240,36 +1227,6 @@ def show_contribution_insights(df):
         st.warning("No hay datos para el rango seleccionado.")
         return
 
-    timeline_stack = (
-        filtered.groupby(["fecha", "dia_nombre"])["cantidad"]
-        .sum()
-        .reset_index()
-    )
-
-    stack_chart = (
-        alt.Chart(timeline_stack)
-        .mark_area(opacity=0.85)
-        .encode(
-            x=alt.X("fecha:T", title="Fecha"),
-            y=alt.Y("cantidad:Q", stack="normalize", title="Participación"),
-            color=alt.Color(
-                "dia_nombre:N",
-                title="Día de la semana",
-                scale=alt.Scale(scheme="category10"),
-            ),
-            tooltip=[
-                alt.Tooltip("fecha:T", title="Fecha", format="%Y-%m-%d"),
-                alt.Tooltip("dia_nombre:N", title="Día"),
-                alt.Tooltip("cantidad:Q", title="Pasajeros", format=",.0f"),
-            ],
-        )
-        .properties(
-            width=900,
-            height=250,
-            title="🧩 Participación por día de la semana en el tiempo",
-        )
-    )
-
     heatmap_data = (
         filtered.groupby(["mes_nombre", "dia_nombre"])["cantidad"]
         .mean()
@@ -1324,11 +1281,7 @@ def show_contribution_insights(df):
     ).round(1)
     summary = summary.round({"promedio": 0, "maximo": 0})
 
-    col_a, col_b = st.columns([3, 2])
-    with col_a:
-        st.altair_chart(stack_chart, use_container_width=True)
-    with col_b:
-        st.altair_chart(heatmap_chart, use_container_width=True)
+    st.altair_chart(heatmap_chart, use_container_width=True)
 
     st.markdown(f"### 📋 Resumen por día - {selected_muni}")
     st.dataframe(
@@ -1400,8 +1353,19 @@ def create_multi_line_selector(df):
     return chart
 
 
-def create_interactive_dashboard(df):
-    """Dashboard completo con filtros previos de Streamlit."""
+def create_interactive_dashboard(df, selected_municipio=None, show_selector=True):
+    """
+    Dashboard completo con filtros previos de Streamlit.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Dataset completo.
+    selected_municipio : str | None
+        Municipio preseleccionado. Si es None se usa el selector.
+    show_selector : bool
+        Si es False, no se renderiza el selector (ideal para integrarlo en otras secciones).
+    """
     if df.empty:
         return None
 
@@ -1436,12 +1400,18 @@ def create_interactive_dashboard(df):
         return None
 
     selector_options = ["Todos"] + municipios
-    selected_municipio = st.selectbox(
-        "Municipio (dashboard)",
-        selector_options,
-        index=0,
-        key="dashboard_municipio",
-    )
+    default_option = selected_municipio if selected_municipio in selector_options else selector_options[0]
+
+    if show_selector:
+        default_index = selector_options.index(default_option)
+        selected_municipio = st.selectbox(
+            "Municipio (dashboard)",
+            selector_options,
+            index=default_index,
+            key="dashboard_municipio",
+        )
+    else:
+        selected_municipio = default_option
 
     if selected_municipio == "Todos":
         muni_daily_filtered = muni_daily.copy()
@@ -2126,7 +2096,39 @@ with tab1:
         st.warning("⚠️ No se pudieron cargar los datos para visualización.")
     else:
         st.info(f"📈 Dataset cargado: {len(df_full):,} registros desde {df_full['fecha'].min().strftime('%Y-%m-%d')} hasta {df_full['fecha'].max().strftime('%Y-%m-%d')}")
-        
+
+        with st.expander("📈 Resumen Estadístico del Dataset", expanded=True):
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Registros", f"{len(df_full):,}")
+            with col2:
+                st.metric("Promedio Pasajeros", f"{df_full['cantidad'].mean():,.0f}")
+            with col3:
+                st.metric("Mediana Pasajeros", f"{df_full['cantidad'].median():,.0f}")
+            with col4:
+                st.metric("Líneas Únicas", f"{df_full['linea'].nunique():,}")
+
+            st.dataframe(
+                df_full[['cantidad', 't_med', 'precip', 'viento']].describe(),
+                use_container_width=True,
+            )
+
+        st.divider()
+
+        selected_municipio_global, selected_month_global = render_global_filter_panel(df_full)
+        use_global_filters = selected_municipio_global is not None
+        global_filter_payload = (
+            {"municipio": selected_municipio_global, "mes": selected_month_global}
+            if use_global_filters
+            else None
+        )
+
+        dashboard_integrated = False
+        explorer_filters = None
+
+        if use_global_filters:
+            st.caption("⚙️ Los filtros de municipio/mes están disponibles en la barra lateral y permanecen visibles mientras navegás.")
+
         # Visualización 1: Explorador interactivo de demanda
         st.subheader("🎯 Explorador Interactivo de Demanda")
         st.markdown("""
@@ -2135,21 +2137,49 @@ with tab1:
         Usa el selector de municipio para filtrar, luego haz click en cualquier punto del gráfico 
         para ver el desglose detallado por línea en ese día específico.
         """)
-        chart_interactive = create_interactive_demand_explorer(df_full)
-        if chart_interactive:
+        explorer_result = create_interactive_demand_explorer(
+            df_full,
+            return_filters=True,
+            preselected=global_filter_payload,
+            show_selectors=not use_global_filters,
+        )
+        if explorer_result:
+            chart_interactive, explorer_filters = explorer_result
             st.altair_chart(chart_interactive, use_container_width=True)
+
+            selected_municipio_dashboard = (explorer_filters or {}).get("municipio")
+            if selected_municipio_dashboard:
+                chart_dashboard_inline = create_interactive_dashboard(
+                    df_full,
+                    selected_municipio=selected_municipio_dashboard,
+                    show_selector=False,
+                )
+                if chart_dashboard_inline:
+                    dashboard_integrated = True
+                    st.markdown("##### Panel complementario del Dashboard Interactivo")
+                    st.caption("""
+                    **Vista general con múltiples gráficos interconectados**, sincronizada con el municipio 
+                    seleccionado en el explorador. Arrastrá sobre el gráfico temporal para filtrar la distribución.
+                    """)
+                    st.altair_chart(chart_dashboard_inline, use_container_width=True)
         
+        selected_municipio_filter = (explorer_filters or {}).get("municipio") or selected_municipio_global
+        selected_month_filter = (explorer_filters or {}).get("mes") or selected_month_global
+
         st.divider()
         
         # Visualización 2: Heatmap interactivo
         st.subheader("🔥 Heatmap: Patrones Temporales")
         st.markdown("""
-        **Selecciona un municipio y arrastra sobre el heatmap para ver detalles**
+        **El heatmap se sincroniza con el municipio (y mes, si aplica) seleccionado arriba**
         
-        El heatmap muestra los patrones de demanda por día de la semana y mes. 
-        Selecciona un área para ver el desglose detallado.
+        Explorá los patrones de demanda por día de la semana y mes para ese contexto filtrado.
         """)
-        chart_heatmap = create_heatmap_interactive(df_full)
+        chart_heatmap = create_heatmap_interactive(
+            df_full,
+            selected_municipio=selected_municipio_filter,
+            selected_month=selected_month_filter,
+        )
         if chart_heatmap:
             st.altair_chart(chart_heatmap, use_container_width=True)
         
@@ -2158,12 +2188,15 @@ with tab1:
         # Visualización 3: Análisis clima vs demanda
         st.subheader("🌦️ Análisis Clima vs Demanda")
         st.markdown("""
-        **Explora cómo el clima afecta la demanda. Click en puntos para destacarlos.**
+        **Filtrado automáticamente según el municipio/mes elegido. Click en puntos para destacarlos.**
         
-        Tres gráficos interconectados muestran la relación entre temperatura, precipitación, 
-        viento y la demanda de pasajeros.
+        Tres gráficos interconectados muestran la relación entre clima y demanda para el mismo contexto seleccionado.
         """)
-        chart_weather = create_weather_scatter_matrix(df_full)
+        chart_weather = create_weather_scatter_matrix(
+            df_full,
+            selected_municipio=selected_municipio_filter,
+            selected_month=selected_month_filter,
+        )
         if chart_weather:
             st.altair_chart(chart_weather, use_container_width=True)
         
@@ -2194,62 +2227,30 @@ with tab1:
         
         st.divider()
         
-        # Visualización 6: Dashboard interactivo
-        st.subheader("🎛️ Dashboard Interactivo")
-        st.markdown("""
-        **Vista general con múltiples gráficos interconectados**
-        
-        Selecciona un municipio y arrastra sobre el gráfico temporal para filtrar 
-        la distribución de pasajeros.
-        """)
-        chart_dashboard = create_interactive_dashboard(df_full)
-        if chart_dashboard:
-            st.altair_chart(chart_dashboard, use_container_width=True)
-        
-        st.divider()
-
-        st.subheader("⚖️ Comparador de Municipios")
-        st.markdown("""
-        **Elegí dos municipios para analizar sus trayectorias y detectar ventajas competitivas.**
-        
-        El panel muestra:
-        - Evolución diaria superpuesta.
-        - Diferencia absoluta día a día.
-        - KPIs agregados con deltas instantáneos.
-        """)
-        show_municipality_comparator(df_full)
-
-        st.divider()
+        if not dashboard_integrated:
+            # Visualización 6: Dashboard interactivo (fallback si no se pudo integrar en el Explorador)
+            st.subheader("🎛️ Dashboard Interactivo")
+            st.markdown("""
+            **Vista general con múltiples gráficos interconectados**
+            
+            Selecciona un municipio y arrastra sobre el gráfico temporal para filtrar 
+            la distribución de pasajeros.
+            """)
+            chart_dashboard = create_interactive_dashboard(df_full)
+            if chart_dashboard:
+                st.altair_chart(chart_dashboard, use_container_width=True)
+            
+            st.divider()
 
         st.subheader("🧩 Contribución por Día y Mes")
         st.markdown("""
         **Explorá cómo se reparte la demanda dentro de un municipio según día de la semana y mes.**
         
         Filtrá un rango temporal para:
-        - Ver la participación relativa de cada día.
         - Identificar meses/días con mayor intensidad.
         - Revisar métricas consolidadas por día.
         """)
         show_contribution_insights(df_full)
-
-        st.divider()
-        
-        # Resumen estadístico
-        with st.expander("📈 Resumen Estadístico del Dataset"):
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Registros", f"{len(df_full):,}")
-            with col2:
-                st.metric("Promedio Pasajeros", f"{df_full['cantidad'].mean():,.0f}")
-            with col3:
-                st.metric("Mediana Pasajeros", f"{df_full['cantidad'].median():,.0f}")
-            with col4:
-                st.metric("Líneas Únicas", f"{df_full['linea'].nunique():,}")
-            
-            st.dataframe(
-                df_full[['cantidad', 't_med', 'precip', 'viento']].describe(),
-                use_container_width=True,
-            )
 
 # ============================================================================
 # TAB 2: PREDICCIÓN (MEJORADO)
