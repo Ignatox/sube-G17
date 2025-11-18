@@ -140,6 +140,59 @@ class Winsorizer(BaseEstimator, TransformerMixin):
         return X_transformed
 
 
+class DropNaRows(BaseEstimator, TransformerMixin):
+    """Elimina filas con NaN en columnas específicas, usado tras generar lags."""
+
+    def __init__(
+        self,
+        columns=None,
+        how="any",
+        skip_if_target_nan: bool = True,
+        target_col: str = "cantidad",
+    ):
+        self.columns = columns or []
+        self.how = how
+        self.skip_if_target_nan = skip_if_target_nan
+        self.target_col = target_col
+
+    def fit(self, X, y=None):
+        return self
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.skip_if_target_nan = True
+        if "target_col" not in self.__dict__:
+            self.target_col = "cantidad"
+        if "columns" not in self.__dict__:
+            self.columns = []
+        if "how" not in self.__dict__:
+            self.how = "any"
+
+    def transform(self, X):
+        X_new = X.copy()
+        skip_if_target_nan = getattr(self, "skip_if_target_nan", True)
+        target_col = getattr(self, "target_col", "cantidad")
+        if not self.columns:
+            return X_new.reset_index(drop=True)
+
+        subset = [col for col in self.columns if col in X_new.columns]
+        if not subset:
+            return X_new.reset_index(drop=True)
+
+        mask = X_new[subset].isna()
+        if skip_if_target_nan and target_col in X_new.columns:
+            future_rows = X_new[target_col].isna()
+            mask.loc[future_rows, :] = False
+
+        if self.how == "all":
+            drop_mask = mask.all(axis=1)
+        else:
+            drop_mask = mask.any(axis=1)
+
+        X_new = X_new.loc[~drop_mask]
+        return X_new.reset_index(drop=True)
+
+
 class LagFeatureCreator(BaseEstimator, TransformerMixin):
     """
     Crea features de lag para series temporales agrupadas.
