@@ -1,12 +1,15 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
 import altair as alt
 from datetime import datetime
 import json
 import requests
 from datetime import date as date_cls
+
+from dependency_utils import ensure_module
+
+joblib = ensure_module("joblib", "joblib==1.4.2")
 
 from sklearn.base import BaseEstimator, TransformerMixin
 

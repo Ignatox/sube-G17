@@ -3,7 +3,6 @@ from pathlib import Path
 
 import altair as alt
 import datetime as dt
-import joblib
 import json
 import numpy as np
 import pandas as pd
@@ -11,6 +10,10 @@ import requests
 import streamlit as st
 from datetime import date as date_cls
 from datetime import datetime
+
+from dependency_utils import ensure_module
+
+joblib = ensure_module("joblib", "joblib==1.4.2")
 
 WEEKDAY_NAMES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
