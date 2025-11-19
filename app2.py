@@ -11,9 +11,7 @@ import streamlit as st
 from datetime import date as date_cls
 from datetime import datetime
 
-from dependency_utils import ensure_module
-
-joblib = ensure_module("joblib", "joblib==1.4.2")
+import joblib
 
 WEEKDAY_NAMES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 

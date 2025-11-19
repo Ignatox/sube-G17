@@ -7,9 +7,7 @@ import json
 import requests
 from datetime import date as date_cls
 
-from dependency_utils import ensure_module
-
-joblib = ensure_module("joblib", "joblib==1.4.2")
+import joblib
 
 from sklearn.base import BaseEstimator, TransformerMixin
 
